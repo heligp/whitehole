@@ -7,7 +7,7 @@ Created on Sat Aug 15 14:48:14 2020
 
 import sys
 import numpy as np
-import xarray as xr
+import zarr
 import pandas as pd
 from dateutil import parser
 from datetime import datetime
@@ -132,46 +132,71 @@ class BaseDecryptor(object):
         #return tuple of information
         return (_initialization, _finalization)
     
-    def read_zarr(self, 
-                  file,
-                  date, 
-                  initialization_step, 
-                  finalization_step):
-        """
-        Get np.array infomration from zarr files.
+    def open_zarr(self, stock,path):         
+        new_path = path+stock+".zarr"
+        zarrds = zarr.open_group(new_path)
+        return zarrds
+    
+            
+    #Funciones para generar el df con precio y volumen
+    def load_data(self, symbol,path,dates):
+        lista = [] 
+        zarrds = self.open_zarr(symbol,path)
+        for date in dates:
+            #print(date)
+            prices,volume,timestamp = self.get_arrs( zarrds,date)
+            X = self.construct_df(prices,volume,timestamp)
+            new_ts = [datetime.fromtimestamp(i) for i in X['ts']/1000]
+            X['ts'] = new_ts#ts_idx
+            X.set_index('ts',inplace=True)
+            lista.append(X)
+        result = pd.concat(lista)
+        return result
+    
+    #Funciones para generar el df con precio y volumen
+    def load_data_day(self, symbol,path,date):
+        zarrds = self.open_zarr(symbol,path)
+        #print(date)
+        prices,volume,timestamp = self.get_arrs( zarrds,date)
+        X = self.construct_df(prices,volume,timestamp)
+        new_ts = [datetime.fromtimestamp(i) for i in X['ts']/1000]
+        X['ts'] = new_ts#ts_idx
+        X.set_index('ts',inplace=True)
         
-        Important:
+        return X
+    
+    #segmentation based on time init and time last
+    def get_arrs(self, zarrds,date_):
+        arr = np.array(zarrds.date)
+        idx = np.where(arr == date_)[0][0]
+        prices =  zarrds.value[idx]
+        prices = prices[prices>0]
+        volume = zarrds.vol[idx]
+        volume = volume[:len(prices)]
+        timestamp = zarrds.timestamp[idx]
+        timestamp = timestamp[:len(prices)]
+        return prices,volume, timestamp
+
+    
+    #construction of final dataframe        
+    def construct_df(self, prices,volume,timestamp):
+        df = pd.DataFrame({
+                'ts':timestamp,
+                'price':prices,
+                'vol':volume,
+                })
+        return df
+    
+    def saves(self, result_df, date_):
         
-        Zarr files will be transformed as xarray.Dataset.
+        nameFile = self.symbol+"_"+date_
         
-        To know about xarray, please check:
-        http://xarray.pydata.org/en/stable/why-xarray.html 
-        """
-        #open zarr
-        data=xr.open_zarr(file).sel(date=date)
+        result_df.to_csv(self.storage_path+nameFile+'.txt')   
+        print("{} {} saved".format(self.symbol, date_))
+        #save and return None
+        return None
         
-        #check if there is dates 
-        if data.timestamp.shape[0] == 0:
-            print('No stored data for this stock/heartbeat')
-            sys.exit()
-        
-        #segmentation based on time init and time last
-        data = data.where(
-            data.timestamp>=initialization_step, 
-            drop=True).where(
-            data.timestamp<finalization_step,
-            drop=True
-        )
-        
-        #set ts (timestamp), prices and values arrays
-        ts = data.timestamp.values
-        prices = data.value.values
-        volume = data.vol.values
-        
-        #construct a useful 2D array of shape(#ticks, 3)
-        return np.dstack(
-            (ts,prices,volume)
-        ).reshape(prices.shape[0], 3)
+
 
 class Decryptor(BaseDecryptor):
     """
@@ -207,12 +232,10 @@ class Decryptor(BaseDecryptor):
                  date = None, 
                  start_date = None, 
                  end_date = None, 
-                 full_day = False, 
-                 start_time = None, 
-                 end_time = None, 
                  save = False, 
                  dataframe = False,
-                 storage_path = None):
+                 storage_path = None,
+                 global_result = False):
         
         #defining parameters
         self.repo_path = repo_path
@@ -220,21 +243,13 @@ class Decryptor(BaseDecryptor):
         self.date = date
         self.start_date = start_date
         self.end_date = end_date
-        self.full_day = full_day
-        self.start_time = start_time
-        self.end_time = end_time
         self.save = save
         self.dataframe = dataframe
         self.storage_path = storage_path
+        self.global_result = global_result
         
         #check if full_day is requested
-        if self.full_day:
-            self.start_time = '9:30'
-            self.end_time = '16:00'
-        #check if you set start and end time
-        elif self.start_time is None and self.end_time is None:
-            print("Define 'full_day=True' or set 'start' & 'end' time value")
-            sys.exit()
+        
         
         #check if single 'date' is requested
         if self.date is not None:
@@ -264,45 +279,33 @@ class Decryptor(BaseDecryptor):
             self.end_date
         )
         
-        #iteration over dates
-        for date_ in range_dates:
-            #path for calling information
-            path = self.repo_path+"/"+self.symbol.lower(
-            ).replace(" ","")+".zarr"
+        
+        
+        if self.dataframe == False:
+            zarrds = self.open_zarr(self.symbol,self.repo_path)
+            return [self.get_arrs(zarrds,date) for date in range_dates]
+                
+        
+        if self.global_result == True:
+            dates = str(range_dates[0]) + "_" + str(range_dates[-1])
+            #iteration over dates
             
-            #define init_time and fin_time
-            init_time, fin_time = self.range_time(
-                date_, 
-                self.start_time, 
-                self.end_time
-            )
+            result_ = self.load_data(self.symbol,
+                                    self.repo_path,
+                                    range_dates)
+           
             
-            #define np.array of shape (#ticks,3)
-            np_result = self.read_zarr(
-                path, 
-                date_, 
-                init_time, 
-                fin_time
-            )
-            
+
             #check if save is requested
             if self.save: 
-                result_ = pd.DataFrame(
-                    np_result,
-                    columns=["ts","price","vol"]
-                ).set_index('ts')
-                nameFile = self.symbol+"_"+date_
-                result_.to_csv(self.storage_path+nameFile+'.txt')   
-                print("{} {} saved".format(self.symbol, date_))
-                #save and return None
-                return None
+                self.saves(result_,dates)
             
-            #check if dataframe is requested
-            if self.dataframe:
-                result_ = pd.DataFrame(np_result,
-                                       columns=["ts","price","vol"])
-                #return dataframe 
-                return result_
-            #return np.array with shape(#ticks,3) 
-            return np_result
-        
+            return result_
+            
+        elif self.global_result == False:
+            for date in range_dates:
+                result_ = self.load_data_day(self.symbol,
+                                                    self.repo_path,
+                                                    date)
+                if self.save: 
+                    self.saves(result_,date)
